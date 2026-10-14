@@ -68,6 +68,11 @@ Needs a Rust toolchain and the usual desktop development headers
 | Macros | transport ready, record format unconfirmed |
 | Firmware update | not implemented |
 
+**2.4 GHz dongle.** Tri-mode models also work through their receiver
+(`3554:fa09`). Settings page, identity, battery and the base key matrix go over
+the dongle; per-key RGB and factory reset need the cable. The keyboard dozes
+after a few idle minutes — if a read times out, press a key and retry.
+
 *Confirmed* means verified against a physical keyboard, not merely read out of
 the Windows driver.
 
@@ -188,6 +193,11 @@ That indexing was settled on hardware rather than guessed. `Fn+Tab` cycles the
 colour of the live effect, and pressing it moved exactly one byte in the whole
 page — `0x3b`, from `40` to `41`, as the keyboard went red to green. One press
 pinned down both the slot indexing and the colour numbering.
+
+Over the dongle the same commands travel as 20-byte interrupt reports on id
+`0x13` — `13 CMD NPKG IDX (OP<<4|LEN) data[14] CSUM`, with read opcodes the
+write opcode `| 0x40` (`0x44` reads the settings page) and `CSUM` the byte sum
+of the first 19 bytes. See `wireless` in [`src/proto.rs`](src/proto.rs).
 
 The full protocol is documented in the doc comments of
 [`src/proto.rs`](src/proto.rs) and

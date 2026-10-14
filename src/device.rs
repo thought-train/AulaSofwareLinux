@@ -17,6 +17,9 @@ pub struct Candidate {
     pub node: HidNode,
     /// Report id carrying the 519-byte vendor feature report.
     pub report_id: u8,
+    /// True for the 2.4 GHz dongle, which carries the same commands as 20-byte
+    /// interrupt reports instead of 520-byte feature reports.
+    pub wireless: bool,
 }
 
 /// Does this node expose the vendor command channel?
@@ -24,12 +27,22 @@ pub fn candidate_for(node: &HidNode) -> Option<Candidate> {
     // The command channel is the feature report whose payload is one page plus
     // the 7 header bytes that follow the report id.
     let want = REPORT_LEN - 1;
-    node.feature_reports
+    if let Some((id, _)) = node.feature_reports.iter().find(|(_, len)| *len == want) {
+        return Some(Candidate {
+            node: node.clone(),
+            report_id: *id,
+            wireless: false,
+        });
+    }
+    // The dongle has no big feature report; its vendor channel is a 19-byte
+    // output report.
+    node.output_reports
         .iter()
-        .find(|(_, len)| *len == want)
+        .find(|(id, len)| *id == proto::WIRELESS_REPORT_ID && *len == proto::WIRELESS_PAYLOAD)
         .map(|(id, _)| Candidate {
             node: node.clone(),
             report_id: *id,
+            wireless: true,
         })
 }
 
@@ -70,7 +83,7 @@ pub struct Keyboard {
 pub fn open(candidate: &Candidate, profiles: &[DeviceProfile]) -> anyhow::Result<Keyboard> {
     let dev = HidDevice::open(&candidate.node)
         .map_err(|e| anyhow::anyhow!("{}", hid::permission_hint(&candidate.node.dev_path, &e)))?;
-    let link = Link::new(dev, candidate.report_id);
+    let link = Link::for_candidate(dev, candidate);
 
     let password = link
         .password()
@@ -109,7 +122,11 @@ pub fn open_as(candidate: &Candidate, profile: &DeviceProfile) -> anyhow::Result
         proto::report_id_for_firmware(profile.fw)
     };
     Ok(Keyboard {
-        link: Link::new(dev, report_id),
+        link: if candidate.wireless {
+            Link::wireless(dev)
+        } else {
+            Link::new(dev, report_id)
+        },
         profile: profile.clone(),
         password: profile.password,
         identified: false,
@@ -154,6 +171,7 @@ mod tests {
             pid: 0x010c,
             name: "BY Tech Gaming Keyboard".into(),
             feature_reports: features,
+            output_reports: vec![],
         }
     }
 
@@ -173,6 +191,24 @@ mod tests {
     fn accepts_the_alternate_report_id() {
         let c = candidate_for(&node(vec![(9, 519)])).expect("should match");
         assert_eq!(c.report_id, 9);
+    }
+
+    #[test]
+    fn accepts_the_dongle_vendor_interface() {
+        let mut n = node(vec![(6, 7)]);
+        n.vid = 0x3554;
+        n.pid = 0xfa09;
+        n.output_reports = vec![(0x13, 19)];
+        let c = candidate_for(&n).expect("should match");
+        assert!(c.wireless);
+        assert_eq!(c.report_id, 0x13);
+    }
+
+    #[test]
+    fn ignores_the_dongle_keyboard_interface() {
+        let mut n = node(vec![]);
+        n.output_reports = vec![(1, 1)];
+        assert!(candidate_for(&n).is_none());
     }
 
     #[test]

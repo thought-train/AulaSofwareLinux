@@ -19,6 +19,8 @@
 //! this family), regardless of how much payload a package carries. Transfers
 //! larger than 512 bytes are split into consecutively numbered packages.
 //!
+//! The 2.4 GHz dongle carries the same commands differently; see [`wireless`].
+//!
 //! A read is a write of the request header followed by a `GET_FEATURE` on the
 //! same report id; the reply repeats the header and carries the data from
 //! byte 8 onwards.
@@ -118,14 +120,200 @@ pub fn package_count(len: usize) -> u8 {
     }
 }
 
+/// Framing for the 2.4 GHz dongle (USB 3554:fa09).
+///
+/// The dongle has no 520-byte feature report. Commands travel as 20-byte
+/// interrupt reports on report id 0x13, in chunks of at most 14 data bytes:
+///
+/// ```text
+/// byte 0      0x13
+/// byte 1      command           wired opcode with bit 6 set for reads, e.g.
+///                               0x04 writes the settings page, 0x44 reads it
+/// byte 2      total packages
+/// byte 3      package index
+/// byte 4      (operation << 4) | chunk length    operation 1 = write
+/// byte 5..18  data
+/// byte 19     sum of bytes 0..18, modulo 256
+/// ```
+///
+/// A read is one request (no data); the keyboard streams every package back.
+/// A write is acknowledged package by package. The keyboard dozes after a few
+/// idle minutes, so a timeout usually means "asleep" rather than "broken".
+pub mod wireless {
+    use std::io;
+    use std::time::Duration;
+
+    use crate::hid::HidDevice;
+
+    pub const REPORT_ID: u8 = 0x13;
+    pub const PACKET_LEN: usize = 20;
+    /// Bytes of data per packet.
+    pub const CHUNK: usize = 14;
+    const REPLY_TIMEOUT: Duration = Duration::from_millis(1500);
+    const DRAIN_TIMEOUT: Duration = Duration::from_millis(40);
+    const RETRIES: u32 = 4;
+
+    /// Wireless read opcodes.
+    pub const GET_IDENTITY: u8 = 0x05;
+    pub const GET_BATTERY: u8 = 0x4a;
+
+    pub fn checksum(packet: &[u8]) -> u8 {
+        packet[..PACKET_LEN - 1]
+            .iter()
+            .fold(0u8, |a, b| a.wrapping_add(*b))
+    }
+
+    /// Build one packet. `operation` is 0 for a request and 1 for a write.
+    pub fn packet(
+        command: u8,
+        operation: u8,
+        data: &[u8],
+        packages: u8,
+        index: u8,
+    ) -> [u8; PACKET_LEN] {
+        assert!(data.len() <= CHUNK, "chunk too large");
+        let mut p = [0u8; PACKET_LEN];
+        p[0] = REPORT_ID;
+        p[1] = command;
+        p[2] = packages;
+        p[3] = index;
+        p[4] = (operation << 4) | data.len() as u8;
+        p[5..5 + data.len()].copy_from_slice(data);
+        p[PACKET_LEN - 1] = checksum(&p);
+        p
+    }
+
+    fn timed_out(what: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no answer to {what} over the dongle — the keyboard may be asleep, press a key"),
+        )
+    }
+
+    /// Next well-formed packet for `command` (reads and acks echo the opcode,
+    /// with bit 7 flagging an error on acks).
+    fn next_reply(dev: &HidDevice, command: u8) -> io::Result<Option<Vec<u8>>> {
+        loop {
+            match dev.read_report(REPLY_TIMEOUT)? {
+                None => return Ok(None),
+                Some(r) if r.len() >= PACKET_LEN && r[0] == REPORT_ID => {
+                    if r[1] & 0x7f == command & 0x7f && r[PACKET_LEN - 1] == checksum(&r) {
+                        return Ok(Some(r));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    pub fn drain(dev: &HidDevice) {
+        while let Ok(Some(_)) = dev.read_report(DRAIN_TIMEOUT) {}
+    }
+
+    /// Issue read opcode `command` and reassemble the packages it streams back.
+    pub fn read(dev: &HidDevice, command: u8) -> io::Result<Vec<u8>> {
+        for _ in 0..RETRIES {
+            drain(dev);
+            dev.write_report(&packet(command, 0, &[], 1, 0))?;
+            let mut chunks: Vec<Option<Vec<u8>>> = Vec::new();
+            while let Some(r) = next_reply(dev, command)? {
+                let total = r[2] as usize;
+                let (idx, len) = (r[3] as usize, (r[4] & 0x0f) as usize);
+                if total == 0 || idx >= total || len > CHUNK {
+                    continue;
+                }
+                if chunks.len() != total {
+                    chunks = vec![None; total];
+                }
+                chunks[idx] = Some(r[5..5 + len].to_vec());
+                if chunks.iter().all(Option::is_some) {
+                    return Ok(chunks.into_iter().flatten().flatten().collect());
+                }
+            }
+        }
+        Err(timed_out(&format!("read 0x{command:02x}")))
+    }
+
+    /// Send `data` under write opcode `command`, waiting for each ack.
+    pub fn write(dev: &HidDevice, command: u8, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        drain(dev);
+        let packages = data.len().div_ceil(CHUNK);
+        if packages > u8::MAX as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "payload too large"));
+        }
+        for (index, chunk) in data.chunks(CHUNK).enumerate() {
+            dev.write_report(&packet(command, 1, chunk, packages as u8, index as u8))?;
+            // Opcodes with bit 7 set are fire-and-forget.
+            if command & 0x80 != 0 {
+                continue;
+            }
+            match next_reply(dev, command)? {
+                None => return Err(timed_out(&format!("package {index} of write 0x{command:02x}"))),
+                Some(ack) if ack[1] & 0x80 != 0 => {
+                    return Err(io::Error::other(format!(
+                        "keyboard rejected package {index} (checksum error)"
+                    )))
+                }
+                Some(ack) if ack[3] as usize != index => {
+                    return Err(io::Error::other(format!(
+                        "ack index mismatch on package {index}"
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(())
+    }
+}
+
+/// Report id of the dongle's vendor channel.
+pub const WIRELESS_REPORT_ID: u8 = wireless::REPORT_ID;
+/// Payload bytes (excluding the report id) of that report.
+pub const WIRELESS_PAYLOAD: usize = wireless::PACKET_LEN - 1;
+
+fn unsupported_wireless(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{what} is not available over the 2.4 GHz dongle; connect the cable"),
+    )
+}
+
 /// A keyboard speaking this protocol.
 pub struct Link {
     dev: HidDevice,
     report_id: u8,
     delay: Duration,
+    wireless: bool,
 }
 
 impl Link {
+    /// Pick the transport the candidate node calls for.
+    pub fn for_candidate(dev: HidDevice, candidate: &crate::device::Candidate) -> Link {
+        if candidate.wireless {
+            Link::wireless(dev)
+        } else {
+            Link::new(dev, candidate.report_id)
+        }
+    }
+
+    /// Link over the 2.4 GHz dongle.
+    pub fn wireless(dev: HidDevice) -> Link {
+        Link {
+            dev,
+            report_id: wireless::REPORT_ID,
+            delay: DEFAULT_DELAY,
+            wireless: true,
+        }
+    }
+
+    pub fn is_wireless(&self) -> bool {
+        self.wireless
+    }
+
     /// `report_id` is normally 6; firmwares that do not identify as 0x18 use 9.
     /// [`report_id_for_firmware`] and the HID descriptor both tell you which.
     pub fn new(dev: HidDevice, report_id: u8) -> Link {
@@ -133,6 +321,7 @@ impl Link {
             dev,
             report_id,
             delay: DEFAULT_DELAY,
+            wireless: false,
         }
     }
 
@@ -151,6 +340,9 @@ impl Link {
 
     /// Send `data`, split into packages, with the given command/parameter.
     pub fn write(&self, command: u8, parameter: u8, data: &[u8]) -> io::Result<()> {
+        if self.wireless {
+            return self.write_wireless(command, parameter, data);
+        }
         let packages = package_count(data.len());
         for (index, chunk) in data.chunks(PAGE).enumerate() {
             let buf = frame(
@@ -169,6 +361,9 @@ impl Link {
 
     /// Request `len` bytes and return them.
     pub fn read(&self, command: u8, parameter: u8, len: usize) -> io::Result<Vec<u8>> {
+        if self.wireless {
+            return self.read_wireless(command, parameter, len);
+        }
         let packages = package_count(len);
         let mut out = Vec::with_capacity(len);
         for index in 0..packages {
@@ -198,6 +393,39 @@ impl Link {
             out.extend_from_slice(&reply[HEADER..HEADER + chunk]);
         }
         Ok(out)
+    }
+
+    /// Wired commands mapped onto the dongle's opcodes. Only what has been
+    /// seen working over the dongle is mapped; everything else is refused
+    /// rather than guessed at.
+    fn read_wireless(&self, command: u8, parameter: u8, len: usize) -> io::Result<Vec<u8>> {
+        let (opcode, want) = match (command, parameter) {
+            (cmd::GET_INFO, cmd::INFO_PASSWORD) => (wireless::GET_IDENTITY, 6),
+            (cmd::GET_POWER, _) => (wireless::GET_BATTERY, 2),
+            (cmd::GET_LED, 0) => (0x44, len),
+            (cmd::GET_MATRIX, 0) => (0x41, len),
+            (cmd::GET_MATRIX, 1) => (0x43, len),
+            _ => return Err(unsupported_wireless(&format!("read 0x{command:02x}"))),
+        };
+        let mut data = wireless::read(&self.dev, opcode)?;
+        if data.len() < want {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("dongle returned {} of {want} bytes", data.len()),
+            ));
+        }
+        data.truncate(want);
+        Ok(data)
+    }
+
+    fn write_wireless(&self, command: u8, parameter: u8, data: &[u8]) -> io::Result<()> {
+        match (command, parameter) {
+            (cmd::SET_LED, 0) => wireless::write(&self.dev, cmd::SET_LED, data),
+            (cmd::SET_MATRIX, 0) => wireless::write(&self.dev, 0x01, data),
+            (cmd::SET_RGB_TABLE, _) => Err(unsupported_wireless("per-key colour")),
+            (cmd::RESET, _) => Err(unsupported_wireless("factory reset")),
+            _ => Err(unsupported_wireless(&format!("write 0x{command:02x}"))),
+        }
     }
 
     fn set_feature_retrying(&self, buf: &[u8]) -> io::Result<()> {
@@ -296,6 +524,25 @@ mod tests {
         let mut f = f;
         f[6] = 6;
         assert_eq!(&f[..8], &[0x06, 0x82, 0x01, 0x00, 0x01, 0x00, 0x06, 0x00]);
+    }
+
+    #[test]
+    fn wireless_packets_carry_a_checksum() {
+        // Captured from a live F99 Pro: battery request and its answer.
+        let req = wireless::packet(0x4a, 0, &[], 1, 0);
+        assert_eq!(req[..5], [0x13, 0x4a, 1, 0, 0]);
+        assert_eq!(req[19], 0x13 + 0x4a + 1);
+        let reply = [
+            0x13, 0x4a, 0x01, 0x00, 0x02, 0x47, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xa8,
+        ];
+        assert_eq!(wireless::checksum(&reply), 0xa8);
+    }
+
+    #[test]
+    fn wireless_write_packet_layout() {
+        let p = wireless::packet(0x04, 1, &[1, 2, 3], 10, 2);
+        assert_eq!(p[..8], [0x13, 0x04, 10, 2, 0x13, 1, 2, 3]);
+        assert_eq!(wireless::checksum(&p), p[19]);
     }
 
     #[test]

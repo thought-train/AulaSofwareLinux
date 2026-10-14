@@ -49,6 +49,8 @@ pub struct HidNode {
     pub name: String,
     /// `(report id, feature payload size in bytes)`, excluding the id byte.
     pub feature_reports: Vec<(u8, usize)>,
+    /// `(report id, payload size in bytes)` of every declared output report.
+    pub output_reports: Vec<(u8, usize)>,
 }
 
 impl HidNode {
@@ -108,6 +110,7 @@ fn read_node(sys: &Path) -> Option<HidNode> {
         pid,
         name: hid_name,
         feature_reports: feature_reports(&desc),
+        output_reports: output_reports(&desc),
     })
 }
 
@@ -116,6 +119,16 @@ fn read_node(sys: &Path) -> Option<HidNode> {
 /// Only the items that matter here are tracked: report id, report size (bits
 /// per field), report count (number of fields) and the Feature main item.
 pub fn feature_reports(desc: &[u8]) -> Vec<(u8, usize)> {
+    reports(desc, 0xb)
+}
+
+/// Like [`feature_reports`], for output reports.
+pub fn output_reports(desc: &[u8]) -> Vec<(u8, usize)> {
+    reports(desc, 0x9)
+}
+
+/// `main_tag` is the HID main item to total up: 0x9 Output, 0xB Feature.
+fn reports(desc: &[u8], main_tag: u8) -> Vec<(u8, usize)> {
     let mut out: Vec<(u8, usize)> = Vec::new();
     let mut report_id: u8 = 0;
     let mut report_size: u32 = 0;
@@ -155,7 +168,7 @@ pub fn feature_reports(desc: &[u8]) -> Vec<(u8, usize)> {
             (1, 0x7) => report_size = data,
             (1, 0x9) => report_count = data,
             // Main items: 0x8 Input, 0x9 Output, 0xB Feature
-            (0, 0xb) => {
+            (0, t) if t == main_tag => {
                 let add = (report_size as u64) * (report_count as u64);
                 match bits.iter_mut().find(|(id, _)| *id == report_id) {
                     Some((_, total)) => *total += add,
@@ -194,6 +207,39 @@ impl HidDevice {
 
     fn fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+
+    /// Send an output report (`write(2)`); `buf[0]` is the report id.
+    pub fn write_report(&self, buf: &[u8]) -> io::Result<usize> {
+        let ret = unsafe { libc::write(self.fd(), buf.as_ptr() as *const libc::c_void, buf.len()) };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ret as usize)
+        }
+    }
+
+    /// Wait up to `timeout` for one input report. `None` on timeout.
+    pub fn read_report(&self, timeout: std::time::Duration) -> io::Result<Option<Vec<u8>>> {
+        let mut pfd = libc::pollfd {
+            fd: self.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(self.fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(buf[..n as usize].to_vec()))
     }
 
     /// `HIDIOCSFEATURE`. `buf[0]` must be the report id.
@@ -268,6 +314,21 @@ mod tests {
     fn finds_the_vendor_feature_reports() {
         let f = feature_reports(F75_IFACE1);
         assert_eq!(f, vec![(5, 5), (6, 519)]);
+    }
+
+    /// Vendor interface of the 2.4 GHz dongle (3554:fa09, second interface),
+    /// trimmed to the collections that matter.
+    const DONGLE_IFACE1: &[u8] = &[
+        0x06, 0x02, 0xff, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x13, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75,
+        0x08, 0x95, 0x13, 0x09, 0x02, 0x81, 0x00, 0x09, 0x02, 0x91, 0x00, 0xc0, 0x06, 0x04, 0xff,
+        0x09, 0x02, 0xa1, 0x02, 0x85, 0x06, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x07,
+        0xb1, 0x02, 0xc0,
+    ];
+
+    #[test]
+    fn dongle_has_a_19_byte_output_report_and_no_big_feature_report() {
+        assert_eq!(output_reports(DONGLE_IFACE1), vec![(0x13, 19)]);
+        assert_eq!(feature_reports(DONGLE_IFACE1), vec![(6, 7)]);
     }
 
     #[test]
